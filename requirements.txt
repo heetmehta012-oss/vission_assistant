@@ -1,0 +1,36 @@
+# AI Assistive Vision System - Python Dependencies
+# =================================================
+
+# --- Core Computer Vision ---
+opencv-python>=4.8.0
+ultralytics>=8.0.0
+
+# --- Face Recognition (offline, dlib-based) ---
+face-recognition>=1.3.0
+# dlib is a dependency of face-recognition.
+# Windows: pip install cmake then pip install dlib
+# macOS/Linux: usually installs automatically
+
+# --- OCR (optional) ---
+pytesseract>=0.3.10
+Pillow>=10.0.0
+
+# --- Speech Recognition ---
+SpeechRecognition>=3.10.0
+PyAudio>=0.2.13
+# Windows:  pip install pipwin && pipwin install pyaudio
+# macOS:    brew install portaudio && pip install pyaudio
+# Linux:    sudo apt install portaudio19-dev python3-pyaudio
+
+# --- Text-to-Speech ---
+pyttsx3>=2.90
+
+# --- Wake Word (optional but recommended) ---
+# pvporcupine>=3.0.0
+# Get a free key at https://console.picovoice.ai/
+# Then: pip install pvporcupine
+# Set env var: PICOVOICE_KEY=your_key_here
+# Falls back to SpeechRecognition if not installed.
+
+# --- Utilities ---
+numpy>=1.24.0
