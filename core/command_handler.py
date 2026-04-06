@@ -5,20 +5,34 @@ Maps spoken voice commands to system actions.
 Now includes face recognition commands (enrol, forget, identify, list).
 """
 
+import re
 import threading
 
 
+def _tokens(text: str) -> set:
+    return set(re.findall(r"[a-z0-9']+", text.lower()))
+
+
+def _has_word(text: str, *words: str) -> bool:
+    t = _tokens(text)
+    return any(w in t for w in words)
+
+
+def _has_shutdown_intent(text: str) -> bool:
+    return bool(re.search(r"\b(stop|exit|quit|shutdown)\b", text))
+
+
 class CommandHandler:
-    def __init__(self, state, frame_lock, detector, ocr, speaker, scene_builder,
-                 face_recognizer=None, cap=None):
+    def __init__(self, state, state_lock, frame_lock, detector, ocr, speaker, scene_builder,
+                 face_recognizer=None):
         self.state           = state
+        self.state_lock      = state_lock
         self.frame_lock      = frame_lock
         self.detector        = detector
         self.ocr             = ocr
         self.speaker         = speaker
         self.scene_builder   = scene_builder
         self.face_recognizer = face_recognizer
-        self.cap             = cap
 
     def handle(self, command_text):
         t = threading.Thread(target=self._dispatch, args=(command_text,), daemon=True)
@@ -28,9 +42,10 @@ class CommandHandler:
         text = text.lower().strip()
         print(f"[CMD] Processing: '{text}'")
 
-        if any(kw in text for kw in ["stop", "exit", "quit", "shutdown"]):
+        if _has_shutdown_intent(text):
             self.speaker.speak("Shutting down. Goodbye.")
-            self.state["running"] = False
+            with self.state_lock:
+                self.state["running"] = False
 
         elif any(kw in text for kw in ["remember", "enrol", "enroll",
                                         "learn my face", "learn face",
@@ -53,26 +68,73 @@ class CommandHandler:
                                         "who have you learned", "known people"]):
             self._list_known_faces()
 
-        elif any(kw in text for kw in ["who is there", "who's there", "identify",
-                                        "who do you see", "who is in front",
-                                        "who", "person", "people", "anyone", "someone"]):
+        elif any(
+            kw in text
+            for kw in [
+                "who is there", "who's there", "who are there",
+                "identify", "who do you see", "who is in front", "who's in front",
+                "who is that", "who's that", "recognize anyone", "recognise anyone",
+            ]
+        ):
             self._identify_people()
 
-        elif any(kw in text for kw in ["describe", "scene", "what do you see",
-                                        "what is around", "surroundings",
-                                        "environment", "what's there", "what is there"]):
+        elif (
+            _has_word(text, "describe")
+            or re.search(r"\bscene\b", text)
+            or any(
+                p in text
+                for p in [
+                    "what do you see",
+                    "what is around",
+                    "surroundings",
+                    "environment",
+                    "what's there",
+                    "what is there",
+                    "look around",
+                ]
+            )
+        ):
             self._describe_scene()
 
-        elif any(kw in text for kw in ["front", "ahead", "in front",
-                                        "what is in front", "what's in front", "forward"]):
+        elif (
+            any(p in text for p in ["in front", "what is in front", "what's in front"])
+            or _has_word(text, "ahead", "forward")
+            or re.search(r"\bfront\b", text)
+        ):
             self._describe_front()
 
-        elif any(kw in text for kw in ["read", "text", "sign", "label",
-                                        "words", "writing", "what does it say"]):
+        elif (
+            _has_word(text, "read", "ocr", "text")
+            or any(
+                p in text
+                for p in [
+                    "sign says",
+                    "the sign",
+                    "label",
+                    "writing on",
+                    "what does it say",
+                    "read the",
+                    "read that",
+                    "read this",
+                ]
+            )
+        ):
             self._read_text()
 
         elif any(kw in text for kw in ["help", "commands", "what can you do"]):
             self._say_help()
+
+        elif any(kw in text for kw in ["enable ai", "turn on ai", "activate ai", "ai on"]):
+            self._toggle_ai(True)
+
+        elif any(kw in text for kw in ["disable ai", "turn off ai", "deactivate ai", "ai off"]):
+            self._toggle_ai(False)
+
+        elif any(kw in text for kw in ["ai detect", "use ai", "ai scan", "ai find", "ai search"]):
+            self._force_ai_detection()
+
+        elif any(kw in text for kw in ["ai status", "ai mode", "check ai"]):
+            self._ai_status()
 
         else:
             self.speaker.speak("I didn't understand that. Say 'help' for available commands.")
@@ -111,14 +173,15 @@ class CommandHandler:
     def _read_text(self):
         with self.frame_lock:
             frame = self.state["latest_frame"]
-        if frame is None:
+            frame_copy = frame.copy() if frame is not None else None
+        if frame_copy is None:
             self.speaker.speak("No camera frame available.")
             return
         if not self.ocr.available:
             self.speaker.speak("Text reading requires Tesseract OCR to be installed.")
             return
         self.speaker.speak("Reading text, please hold still.")
-        text = self.ocr.read_text(frame)
+        text = self.ocr.read_text(frame_copy)
         if text:
             self.speaker.speak(f"I can see: {text}")
         else:
@@ -126,11 +189,15 @@ class CommandHandler:
 
     def _identify_people(self):
         with self.frame_lock:
-            frame      = self.state["latest_frame"]
+            frame_copy = (
+                self.state["latest_frame"].copy()
+                if self.state["latest_frame"] is not None
+                else None
+            )
             detections = list(self.state["latest_detections"])
 
-        if self.face_recognizer and self.face_recognizer.available and frame is not None:
-            faces = self.face_recognizer.identify(frame)
+        if self.face_recognizer and self.face_recognizer.available and frame_copy is not None:
+            faces = self.face_recognizer.identify(frame_copy)
             if not faces:
                 self.speaker.speak(self.scene_builder.build_person_description(detections))
                 return
@@ -158,10 +225,13 @@ class CommandHandler:
         if not self.face_recognizer.available:
             self.speaker.speak("Face recognition requires the face-recognition library.")
             return
-        if self.cap is None:
-            self.speaker.speak("Camera is not available for enrolment.")
-            return
-        self.face_recognizer.enroll(name, self.cap, self.speaker)
+        self.face_recognizer.enroll(
+            name,
+            self.state,
+            self.state_lock,
+            self.frame_lock,
+            self.speaker,
+        )
 
     def _forget_face(self, name):
         if not self.face_recognizer:
@@ -194,5 +264,59 @@ class CommandHandler:
             "'forget John' to remove someone. "
             "'who do you know' to list enrolled faces. "
             "'read text' for OCR. "
+            "'enable AI' or 'disable AI' to control AI detection. "
+            "'AI detect' to force AI detection now. "
+            "'AI status' to check AI mode. "
             "'stop' to exit."
         )
+
+    def _toggle_ai(self, enable):
+        """Toggle AI fallback detection on/off"""
+        if hasattr(self.detector, 'ai_fallback'):
+            self.detector.ai_fallback = enable
+            status = "enabled" if enable else "disabled"
+            self.speaker.speak(f"AI detection {status}.")
+        else:
+            self.speaker.speak("AI detection is not available.")
+
+    def _force_ai_detection(self):
+        """Force AI detection on current frame"""
+        if not hasattr(self.detector, 'ai_detector') or not self.detector.ai_detector:
+            self.speaker.speak("AI detection is not available.")
+            return
+        
+        if not self.detector.ai_detector.is_ready():
+            self.speaker.speak("AI detector is not ready.")
+            return
+        
+        with self.frame_lock:
+            frame = self.state.get("latest_frame")
+            if frame is None:
+                self.speaker.speak("No camera frame available.")
+                return
+        
+        self.speaker.speak("Running AI detection...")
+        ai_detections = self.detector.ai_detector.detect_objects(frame)
+        
+        if ai_detections:
+            objects = [det.get('class', det.get('label', 'unknown')) for det in ai_detections]
+            description = "AI found: " + ", ".join(objects[:5])  # Limit to 5 objects
+            self.speaker.speak(description)
+        else:
+            self.speaker.speak("AI didn't detect any additional objects.")
+
+    def _ai_status(self):
+        """Report current AI status"""
+        if not hasattr(self.detector, 'ai_fallback'):
+            self.speaker.speak("AI detection is not available.")
+            return
+        
+        ai_enabled = self.detector.ai_fallback
+        ai_ready = (hasattr(self.detector, 'ai_detector') and 
+                   self.detector.ai_detector and 
+                   self.detector.ai_detector.is_ready())
+        
+        status = "enabled" if ai_enabled else "disabled"
+        ready_status = "ready" if ai_ready else "not ready"
+        
+        self.speaker.speak(f"AI detection is {status} and {ready_status}.")

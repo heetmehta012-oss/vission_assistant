@@ -13,6 +13,7 @@ PLURALS = {
     "person": "people",
     "chair": "chairs",
     "table": "tables",
+    "dining table": "dining tables",
     "laptop": "laptops",
     "cell phone": "phones",
     "cup": "cups",
@@ -21,6 +22,14 @@ PLURALS = {
     "car": "cars",
     "dog": "dogs",
     "cat": "cats",
+    "bus": "buses",
+    "bench": "benches",
+    "mouse": "mice",
+    "traffic light": "traffic lights",
+    "stop sign": "stop signs",
+    "potted plant": "potted plants",
+    "fire hydrant": "fire hydrants",
+    "parking meter": "parking meters",
 }
 
 def pluralize(word, count):
@@ -31,11 +40,13 @@ def pluralize(word, count):
 
 # Priority order for narration (most important first)
 PRIORITY_ORDER = [
-    "person", "dog", "cat", "car", "bicycle",
-    "traffic light", "stop sign", "stairs",
-    "chair", "table", "door", "couch", "bed",
+    "person", "dog", "cat", "car", "bicycle", "bus", "truck", "motorcycle",
+    "traffic light", "stop sign", "fire hydrant", "stairs",
+    "chair", "dining table", "table", "door", "couch", "bed",
     "laptop", "monitor", "tv", "keyboard", "mouse",
     "cell phone", "book", "cup", "bottle", "backpack",
+    "microwave", "oven", "refrigerator", "sink", "toilet",
+    "bench", "potted plant", "suitcase", "umbrella", "handbag",
 ]
 
 

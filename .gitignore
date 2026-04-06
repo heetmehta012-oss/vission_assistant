@@ -1,0 +1,17 @@
+.venv/
+venv/
+__pycache__/
+*.py[cod]
+*.pyo
+.Python
+*.egg-info/
+.eggs/
+dist/
+build/
+
+# Local face encodings (biometric data)
+known_faces/*.pkl
+
+# IDE
+.idea/
+.vscode/

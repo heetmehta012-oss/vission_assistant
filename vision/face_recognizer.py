@@ -22,6 +22,7 @@ import time
 import cv2
 import numpy as np
 import threading
+from PIL import Image
 
 try:
     import face_recognition
@@ -37,6 +38,56 @@ DATA_DIR   = os.path.join(os.path.dirname(__file__), "..", "known_faces")
 DATA_FILE  = os.path.join(DATA_DIR, "encodings.pkl")
 TOLERANCE  = 0.55   # lower = stricter match (0.4–0.6 works well)
 ENROLL_SEC = 5      # seconds of frames used per enrolment
+
+_dlib_reject_logged = False
+
+
+def _normalize_bgr_uint8(frame):
+    """Return contiguous BGR uint8 (H,W,3), or None."""
+    if frame is None or frame.size == 0:
+        return None
+    img = np.asarray(frame)
+    if img.dtype != np.uint8:
+        if np.issubdtype(img.dtype, np.floating) and float(np.max(img)) <= 1.0:
+            img = (np.clip(img, 0.0, 1.0) * 255.0).astype(np.uint8)
+        else:
+            img = np.clip(img, 0, 255).astype(np.uint8)
+    if img.ndim == 2:
+        img = cv2.cvtColor(img, cv2.COLOR_GRAY2BGR)
+    elif img.ndim == 3 and img.shape[2] == 4:
+        img = cv2.cvtColor(img, cv2.COLOR_BGRA2BGR)
+    elif img.ndim != 3 or img.shape[2] != 3:
+        return None
+    return np.ascontiguousarray(img)
+
+
+def _dlib_rgb_and_gray(bgr_uint8):
+    """
+    dlib + NumPy 2.x on Windows often reject raw OpenCV arrays. Use the same
+    ndarray layout as face_recognition.load_image_file() (PIL -> array).
+    """
+    rgb = cv2.cvtColor(bgr_uint8, cv2.COLOR_BGR2RGB)
+    gray = cv2.cvtColor(bgr_uint8, cv2.COLOR_BGR2GRAY)
+    rgb_out = np.asarray(Image.fromarray(rgb, mode="RGB"), dtype=np.uint8)
+    gray_out = np.asarray(Image.fromarray(gray, mode="L"), dtype=np.uint8)
+    return rgb_out, gray_out
+
+
+def _hog_face_locations(rgb_u8, gray_u8):
+    """HOG detector: try grayscale first (2-D), then RGB. Returns [] if dlib rejects both."""
+    global _dlib_reject_logged
+    for img in (gray_u8, rgb_u8):
+        try:
+            return face_recognition.face_locations(img, model="hog")
+        except RuntimeError:
+            continue
+    if not _dlib_reject_logged:
+        print(
+            "[FACE] dlib could not read webcam frames (NumPy/dlib layout). "
+            "Try: pip install \"numpy<2\" then reinstall. Face ID disabled until fixed."
+        )
+        _dlib_reject_logged = True
+    return []
 
 
 class FaceRecognizer:
@@ -81,19 +132,23 @@ class FaceRecognizer:
 
     # ── Enrolment ────────────────────────────────────────────────────────────
 
-    def enroll(self, name: str, cap, speaker) -> bool:
+    def enroll(self, name: str, state, state_lock, frame_lock, speaker) -> bool:
         """
-        Collect ENROLL_SEC seconds of frames from `cap` and build an
-        average encoding for `name`. Returns True on success.
+        Collect ENROLL_SEC seconds of frames from the shared camera feed
+        (via state['latest_frame']) so only the camera thread reads VideoCapture.
 
-        cap     : an open cv2.VideoCapture object
-        speaker : Speaker instance (for spoken feedback)
+        state / state_lock : for enroll_status overlay and coordination
+        frame_lock         : protects latest_frame snapshots
+        speaker            : Speaker instance (for spoken feedback)
         """
         if not self.available:
             speaker.speak("Face recognition is not available.")
             return False
 
         name = name.strip().title()
+        with state_lock:
+            state["enroll_status"] = f"Enrolling {name} — look at the camera"
+
         speaker.speak(
             f"Enrolling {name}. Please look directly at the camera. "
             f"I will capture your face for {ENROLL_SEC} seconds."
@@ -103,56 +158,70 @@ class FaceRecognizer:
         collected = []
         start = time.time()
 
-        while time.time() - start < ENROLL_SEC:
-            ret, frame = cap.read()
-            if not ret:
-                continue
+        try:
+            while time.time() - start < ENROLL_SEC:
+                with state_lock:
+                    if not state["running"]:
+                        return False
 
-            rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
-            boxes    = face_recognition.face_locations(rgb, model="hog")
-            encodings = face_recognition.face_encodings(rgb, boxes)
+                with frame_lock:
+                    frame = state["latest_frame"]
+                    frame_copy = frame.copy() if frame is not None else None
 
-            if encodings:
-                collected.append(encodings[0])
-                # Visual feedback: green rectangle while capturing
-                for (top, right, bottom, left) in boxes:
-                    cv2.rectangle(frame, (left, top), (right, bottom), (0, 200, 0), 2)
-                cv2.putText(frame, f"Enrolling {name}...", (10, 30),
-                            cv2.FONT_HERSHEY_SIMPLEX, 0.8, (0, 200, 0), 2)
-            else:
-                cv2.putText(frame, "No face detected – move closer", (10, 30),
-                            cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 0, 200), 2)
+                if frame_copy is None:
+                    time.sleep(0.05)
+                    continue
 
-            cv2.imshow("AI Vision Assistant (Press Q to quit)", frame)
-            cv2.waitKey(1)
+                bgr = _normalize_bgr_uint8(frame_copy)
+                if bgr is None:
+                    time.sleep(0.05)
+                    continue
 
-        if len(collected) < 5:
+                rgb_u8, gray_u8 = _dlib_rgb_and_gray(bgr)
+                boxes = _hog_face_locations(rgb_u8, gray_u8)
+                try:
+                    encodings = face_recognition.face_encodings(rgb_u8, boxes)
+                except RuntimeError:
+                    encodings = []
+
+                if encodings:
+                    collected.append(encodings[0])
+                    with state_lock:
+                        state["enroll_status"] = f"Enrolling {name} — face detected, hold still"
+                else:
+                    with state_lock:
+                        state["enroll_status"] = f"Enrolling {name} — no face yet, move closer"
+
+                time.sleep(0.04)
+
+            if len(collected) < 5:
+                speaker.speak(
+                    f"Not enough face samples captured for {name}. "
+                    "Please try again with better lighting and face the camera directly."
+                )
+                return False
+
+            mean_encoding = np.mean(collected, axis=0)
+
+            with self._lock:
+                paired = [(e, n) for e, n in zip(self.known_encodings, self.known_names)
+                          if n != name]
+                self.known_encodings = [p[0] for p in paired]
+                self.known_names     = [p[1] for p in paired]
+
+                self.known_encodings.append(mean_encoding)
+                self.known_names.append(name)
+                self._save()
+
             speaker.speak(
-                f"Not enough face samples captured for {name}. "
-                "Please try again with better lighting and face the camera directly."
+                f"Got it! I have learned {name}'s face from "
+                f"{len(collected)} samples. I will recognise them next time."
             )
-            return False
-
-        # Average the collected encodings for a more robust representation
-        mean_encoding = np.mean(collected, axis=0)
-
-        with self._lock:
-            # Remove old encodings for the same name (re-enrolment)
-            paired = [(e, n) for e, n in zip(self.known_encodings, self.known_names)
-                      if n != name]
-            self.known_encodings = [p[0] for p in paired]
-            self.known_names     = [p[1] for p in paired]
-
-            self.known_encodings.append(mean_encoding)
-            self.known_names.append(name)
-            self._save()
-
-        speaker.speak(
-            f"Got it! I have learned {name}'s face from "
-            f"{len(collected)} samples. I will recognise them next time."
-        )
-        print(f"[FACE] Enrolled '{name}' with {len(collected)} samples.")
-        return True
+            print(f"[FACE] Enrolled '{name}' with {len(collected)} samples.")
+            return True
+        finally:
+            with state_lock:
+                state["enroll_status"] = None
 
     def forget(self, name: str, speaker):
         """Remove a person from the database."""
@@ -189,11 +258,17 @@ class FaceRecognizer:
         if not self.available:
             return []
 
-        rgb   = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
-        h, w  = frame.shape[:2]
-        # Use hog (CPU) model – faster than cnn on laptop
-        boxes     = face_recognition.face_locations(rgb, model="hog")
-        encodings = face_recognition.face_encodings(rgb, boxes)
+        bgr = _normalize_bgr_uint8(frame)
+        if bgr is None:
+            return []
+
+        rgb_u8, gray_u8 = _dlib_rgb_and_gray(bgr)
+        h, w = rgb_u8.shape[:2]
+        boxes = _hog_face_locations(rgb_u8, gray_u8)
+        try:
+            encodings = face_recognition.face_encodings(rgb_u8, boxes)
+        except RuntimeError:
+            return []
 
         results = []
         with self._lock:

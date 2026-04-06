@@ -2,12 +2,12 @@
 AI Assistive Vision System - Main Entry Point
 =============================================
 Capabilities:
-  - YOLOv8 object detection (webcam)
-  - Face recognition (offline, local DB)
-  - Wake-word activation ("Hey Vision" / "computer")
-  - Voice commands via microphone
-  - Text-to-speech responses
-  - OCR (optional, requires Tesseract)
+ - YOLOv8 object detection (webcam)
+ - Face recognition (offline, local DB)
+ - Wake-word activation ("Hey Vision" / "computer")
+ - Voice commands via microphone
+ - Text-to-speech responses
+ - OCR (optional, requires Tesseract)
 """
 
 import threading
@@ -25,8 +25,20 @@ from core.scene_builder     import SceneBuilder
 from core.command_handler   import CommandHandler
 
 
-# How long (seconds) the system stays "awake" after a wake word
+# How long (seconds) system stays "awake" after a wake word
 ACTIVE_WINDOW = 15
+
+# Auto-describe while sleeping: interval between checks, and min seconds before repeating the same line
+AUTO_DESCRIBE_INTERVAL_SEC = 10
+AUTO_DESCRIBE_REPEAT_SAME_AFTER_SEC = 45
+
+
+def wake_prompt_for_mode(mode: str) -> str:
+    if mode == "porcupine":
+        return "computer"
+    if mode == "sr_fallback":
+        return "hey vision"
+    return "Enter (in this terminal)"
 
 
 def main():
@@ -56,7 +68,7 @@ def main():
     if not cap.isOpened():
         print("[ERROR] Could not open webcam.")
         sys.exit(1)
-    cap.set(cv2.CAP_PROP_FRAME_WIDTH,  640)
+    cap.set(cv2.CAP_PROP_FRAME_WIDTH, 640)
     cap.set(cv2.CAP_PROP_FRAME_HEIGHT, 480)
 
     print("[INIT] Starting wake-word detector...")
@@ -65,7 +77,9 @@ def main():
     print("[INIT] Starting voice listener...")
     listener = VoiceListener()
 
-    # ── Shared state ──────────────────────────────────────────────────────────
+    # ── Shared state ──────────────────────────────────────────────────
+    state_lock = threading.Lock()
+    frame_lock = threading.Lock()
     state = {
         "latest_frame":      None,
         "latest_detections": [],
@@ -73,30 +87,52 @@ def main():
         "running":           True,
         "active":            False,   # True = listening for commands
         "active_until":      0.0,     # epoch time when active window expires
+        "enroll_status":     None,    # str overlay during face enrolment
+        "last_auto_describe":       "",   # debounce identical auto-narration
+        "last_auto_describe_at":    0.0,  # epoch when we last spoke auto-describe
     }
-    frame_lock = threading.Lock()
 
-    # ── Command handler ───────────────────────────────────────────────────────
+    # ── Command handler ───────────────────────────────────────────────
     command_handler = CommandHandler(
         state=state,
+        state_lock=state_lock,
         frame_lock=frame_lock,
         detector=detector,
         ocr=ocr,
         speaker=speaker,
         scene_builder=scene_builder,
         face_recognizer=face_recognizer,
-        cap=cap,
     )
 
-    # ─────────────────────────────────────────────────────────────────────────
+    # ── Threads ───────────────────────────────────────────────
+    ww_phrase = wake_prompt_for_mode(wake_detector.mode)
+    enrolled = face_recognizer.list_known() if face_recognizer.available else []
+
+    print("\n[READY] System is running!")
+    print(f"  Wake word : say '{ww_phrase}' to activate")
+    print(f"  Commands  : describe scene / who is there / remember <name> / read text / stop")
+    print(f"  Enrolled  : {enrolled if enrolled else 'nobody yet — say: remember <name>'}")
+    print("  Press Q in the camera window to quit\n")
+
+    speaker.speak(
+        f"Vision assistant ready. Say {ww_phrase} to activate me. "
+        + (f"I recognise {len(enrolled)} {'person' if len(enrolled)==1 else 'people'}."
+           if enrolled else "No faces enrolled yet.")
+    )
+
+    # ─────────────────────────────────────────────────────────────────
     # Thread 1: Camera + Detection + Face Recognition
-    # ─────────────────────────────────────────────────────────────────────────
+    # ─────────────────────────────────────────────────────────────────
     def camera_loop():
         print("[CAMERA] Camera loop started.")
         face_tick = 0   # run face recognition every N frames (slower)
         FACE_EVERY = 10
 
-        while state["running"]:
+        while True:
+            with state_lock:
+                if not state["running"]:
+                    break
+
             ret, frame = cap.read()
             if not ret:
                 continue
@@ -114,7 +150,7 @@ def main():
             with frame_lock:
                 state["latest_frame"]      = frame.copy()
                 state["latest_detections"] = detections
-                if faces:                         # keep last known faces if none this tick
+                if faces:
                     state["latest_faces"] = faces
 
             # Draw object boxes
@@ -125,114 +161,110 @@ def main():
                     f = list(state["latest_faces"])
                 annotated = face_recognizer.draw_faces(annotated, f)
 
-            # Status overlay
-            status = "ACTIVE — listening" if state["active"] else \
-                     f"SLEEPING — say '{wake_detector.mode == 'porcupine' and 'computer' or 'hey vision'}' to wake"
-            cv2.putText(annotated, status, (10, annotated.shape[0] - 10),
-                        cv2.FONT_HERSHEY_SIMPLEX, 0.5,
-                        (0, 200, 0) if state["active"] else (100, 100, 100), 1)
-
-            cv2.imshow("AI Vision Assistant (press Q to quit)", annotated)
-            if cv2.waitKey(1) & 0xFF == ord("q"):
-                state["running"] = False
+            cv2.imshow("Vision Assistant", annotated)
+            if cv2.waitKey(1) & 0xFF == ord('q'):
+                with state_lock:
+                    state["running"] = False
                 break
 
-    # ─────────────────────────────────────────────────────────────────────────
-    # Thread 2: Wake-word listener → activates command window
-    # ─────────────────────────────────────────────────────────────────────────
+    # Thread 2: Wake-word detection (Porcupine or SR fallback)
+    # ─────────────────────────────────────────────────────────────────
     def wake_loop():
         print("[WAKE] Wake-word loop started.")
         time.sleep(2)
 
-        while state["running"]:
-            # Block until wake word fires (poll every 0.1s to check running)
+        while True:
+            with state_lock:
+                if not state["running"]:
+                    break
             fired = wake_detector.detected(timeout=0.5)
             if not fired:
                 continue
 
-            # Activate command window
-            state["active"]       = True
-            state["active_until"] = time.time() + ACTIVE_WINDOW
-            speaker.speak("Yes? I'm listening.")
-            print(f"[WAKE] Active for {ACTIVE_WINDOW}s.")
+            with state_lock:
+                state["active_until"] = time.time() + ACTIVE_WINDOW
+                state["active"] = True
+            print("[WAKE] Wake word detected!")
+            speaker.speak("Yes?")
+            # Give a moment for the voice listener to take over
+            time.sleep(1)
 
-    # ─────────────────────────────────────────────────────────────────────────
-    # Thread 3: Active-window expiry watchdog
-    # ─────────────────────────────────────────────────────────────────────────
-    def active_watchdog():
-        while state["running"]:
-            if state["active"] and time.time() > state["active_until"]:
-                state["active"] = False
-                print("[WAKE] Active window expired. Back to sleep.")
-            time.sleep(0.5)
-
-    # ─────────────────────────────────────────────────────────────────────────
-    # Thread 4: Voice command listener (only processes when active)
-    # ─────────────────────────────────────────────────────────────────────────
+    # Thread 3: Voice command listener (active only after wake word)
+    # ─────────────────────────────────────────────────────────────────
     def voice_loop():
         print("[VOICE] Voice command loop started.")
         time.sleep(3)
 
-        while state["running"]:
-            if not state["active"]:
-                time.sleep(0.2)
-                continue
+        while True:
+            with state_lock:
+                if not state["running"]:
+                    break
+                # Auto-deactivate after ACTIVE_WINDOW seconds of inactivity
+                if state["active"] and time.time() > state["active_until"]:
+                    state["active"] = False
+                    continue
 
-            command = listener.listen()
-            if command:
-                # Reset the active window on each successful command
-                state["active_until"] = time.time() + ACTIVE_WINDOW
-                command_handler.handle(command)
+            # Listen only when "active" (after wake word)
+            if state["active"]:
+                command = listener.listen()
+                if command:
+                    command_handler.handle(command)
+                    # Reset activity window on any command
+                    with state_lock:
+                        state["active_until"] = time.time() + ACTIVE_WINDOW
+                # Stay active for continuous commands
 
-    # ─────────────────────────────────────────────────────────────────────────
-    # Thread 5: Auto-describe (only while sleeping, every 10s)
-    # ─────────────────────────────────────────────────────────────────────────
+    # Thread 4: Auto-describe while sleeping (no recent commands)
+    # ─────────────────────────────────────────────────────────────────
     def auto_describe_loop():
         print("[AUTO] Auto-describe loop started.")
         time.sleep(5)
-        while state["running"]:
-            if not state["active"]:
-                with frame_lock:
-                    detections = list(state["latest_detections"])
-                    faces      = list(state["latest_faces"])
-                if detections:
-                    desc = scene_builder.build_description(detections)
-                    # Prepend known face names if any
-                    known = [f["name"] for f in faces if f["name"] != "Unknown"]
-                    if known:
-                        desc = ", ".join(known) + " detected. " + desc
-                    speaker.speak(desc)
-            time.sleep(10)
 
-    # ── Launch threads ────────────────────────────────────────────────────────
+        while True:
+            with state_lock:
+                if not state["running"]:
+                    break
+                # Don't auto-describe if user has recently interacted
+                if state["active"]:
+                    continue
+                # Don't auto-describe if we spoke the same line recently
+                if time.time() - state["last_auto_describe_at"] < AUTO_DESCRIBE_REPEAT_SAME_AFTER_SEC:
+                    continue
+
+            with frame_lock:
+                detections = list(state["latest_detections"])
+            description = scene_builder.build_description(detections)
+            if description and description != state["last_auto_describe"]:
+                speaker.speak(description)
+                state["last_auto_describe"] = description
+                state["last_auto_describe_at"] = time.time()
+
+            time.sleep(AUTO_DESCRIBE_INTERVAL_SEC)
+
+    # Thread 5: Watchdog to keep the process alive on Windows
+    # ─────────────────────────────────────────────────────────────────
+    def active_watchdog():
+        while True:
+            with state_lock:
+                if not state["running"]:
+                    break
+            time.sleep(1)
+
+    # ── Start all threads ───────────────────────────────────────────────
     threads = [
-        threading.Thread(target=camera_loop,       daemon=True),
-        threading.Thread(target=wake_loop,          daemon=True),
-        threading.Thread(target=active_watchdog,    daemon=True),
+        threading.Thread(target=camera_loop,     daemon=True),
+        threading.Thread(target=wake_loop,        daemon=True),
         threading.Thread(target=voice_loop,         daemon=True),
         threading.Thread(target=auto_describe_loop, daemon=True),
     ]
     for t in threads:
         t.start()
 
-    ww_phrase = "computer" if wake_detector.mode == "porcupine" else "hey vision"
-    enrolled = face_recognizer.list_known() if face_recognizer.available else []
-
-    print("\n[READY] System is running!")
-    print(f"  Wake word : say '{ww_phrase}' to activate")
-    print(f"  Commands  : describe scene / who is there / remember <name> / read text / stop")
-    print(f"  Enrolled  : {enrolled if enrolled else 'nobody yet — say: remember <name>'}")
-    print("  Press Q in the camera window to quit\n")
-
-    speaker.speak(
-        f"Vision assistant ready. Say {ww_phrase} to activate me. "
-        + (f"I recognise {len(enrolled)} {'person' if len(enrolled)==1 else 'people'}."
-           if enrolled else "No faces enrolled yet.")
-    )
-
     # Main thread keeps alive until camera loop exits
     threads[0].join()
-    state["running"] = False
+    with state_lock:
+        state["running"] = False
+    wake_detector.stop()
     cap.release()
     cv2.destroyAllWindows()
     print("[EXIT] Vision Assistant shut down.")

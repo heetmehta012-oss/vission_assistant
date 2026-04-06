@@ -58,16 +58,17 @@ class Speaker:
         while True:
             try:
                 text = self.queue.get(timeout=0.5)
-                self._speaking = True
-                engine.say(text)
-                engine.runAndWait()
-                self._speaking = False
-                self.queue.task_done()
             except queue.Empty:
                 continue
+            self._speaking = True
+            try:
+                engine.say(text)
+                engine.runAndWait()
             except Exception as e:
                 print(f"[TTS] Error: {e}")
+            finally:
                 self._speaking = False
+                self.queue.task_done()
 
     @property
     def is_speaking(self):
