@@ -39,17 +39,6 @@ python main.py
 
 Press **Q** in the camera window to quit, or say **stop** while the command window is active.
 
-## AI Voice Commands
-
-The system supports voice commands to control AI detection:
-
-- **"Enable AI" / "Turn on AI"** - Activate AI fallback detection
-- **"Disable AI" / "Turn off AI"** - Deactivate AI fallback detection  
-- **"AI detect" / "Use AI"** - Force AI detection on current frame
-- **"AI status" / "Check AI"** - Report current AI mode and readiness
-
-AI detection runs automatically when YOLO finds few objects, but these commands give you manual control.
-
 ## Detection tuning (YOLO)
 
 Default model is **YOLOv8s** (`yolov8s.pt`), which is more accurate than nano at the cost of some FPS. First run downloads weights into the project folder.
